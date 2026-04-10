@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: garmin-sync
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server:app
+    envVars:
+      - key: GARMIN_EMAIL
+        value: evgeny.marenko@gmail.com
+      - key: GARMIN_PASSWORD
+        value: Votorantim!2026
+      - key: API_SECRET
+        value: evgeny-health-2026
