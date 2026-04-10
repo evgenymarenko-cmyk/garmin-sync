@@ -14,20 +14,42 @@ API_SECRET = os.environ.get("API_SECRET", "healthlog123")
 
 # Global client — persists session across requests
 client = None
-mfa_pending = False
-mfa_callback = None
+SESSION_FILE = "/tmp/garmin_session.json"
 
 def get_client():
     global client
-    if client is None:
-        client = Garmin(EMAIL, PASSWORD)
+    if client is not None:
+        return client
+
+    client = Garmin(EMAIL, PASSWORD)
+
+    # Try loading saved session first
+    if os.path.exists(SESSION_FILE):
         try:
-            client.login()
-            logging.info("Garmin login successful")
+            with open(SESSION_FILE, "r") as f:
+                saved = json.load(f)
+            client.garth.loads(saved)
+            client.display_name = saved.get("display_name", EMAIL)
+            logging.info("Loaded saved Garmin session")
+            return client
         except Exception as e:
-            logging.error(f"Garmin login failed: {e}")
-            client = None
-            raise e
+            logging.warning(f"Saved session invalid: {e}")
+
+    # Fresh login
+    try:
+        client.login()
+        # Save session for reuse
+        with open(SESSION_FILE, "w") as f:
+            data = client.garth.dumps()
+            if isinstance(data, str):
+                f.write(data)
+            else:
+                json.dump(data, f)
+        logging.info("Garmin login successful, session saved")
+    except Exception as e:
+        logging.error(f"Garmin login failed: {e}")
+        client = None
+        raise e
     return client
 
 def require_secret(f):
@@ -62,6 +84,13 @@ def submit_mfa():
     try:
         client = Garmin(EMAIL, PASSWORD)
         client.login(code)
+        # Save session
+        with open(SESSION_FILE, "w") as f:
+            data = client.garth.dumps()
+            if isinstance(data, str):
+                f.write(data)
+            else:
+                json.dump(data, f)
         return jsonify({"status": "MFA successful, logged in"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
