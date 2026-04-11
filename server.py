@@ -1,56 +1,26 @@
-import os, json, logging
+import os, json, logging, requests
 from datetime import date, timedelta
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from garminconnect import Garmin, GarminConnectAuthenticationError, GarminConnectTooManyRequestsError
 
 logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 CORS(app)
 
-EMAIL = os.environ.get("GARMIN_EMAIL")
-PASSWORD = os.environ.get("GARMIN_PASSWORD")
 API_SECRET = os.environ.get("API_SECRET", "healthlog123")
+JWT_WEB = os.environ.get("JWT_WEB")
+SESSION_ID = os.environ.get("SESSION_ID")
 
-# Global client — persists session across requests
-client = None
-SESSION_FILE = "/tmp/garmin_session.json"
+BASE = "https://connect.garmin.com"
 
-def get_client():
-    global client
-    if client is not None:
-        return client
-
-    client = Garmin(EMAIL, PASSWORD)
-
-    # Try loading saved session first
-    if os.path.exists(SESSION_FILE):
-        try:
-            with open(SESSION_FILE, "r") as f:
-                saved = json.load(f)
-            client.garth.loads(saved)
-            client.display_name = saved.get("display_name", EMAIL)
-            logging.info("Loaded saved Garmin session")
-            return client
-        except Exception as e:
-            logging.warning(f"Saved session invalid: {e}")
-
-    # Fresh login
-    try:
-        client.login()
-        # Save session for reuse
-        with open(SESSION_FILE, "w") as f:
-            data = client.garth.dumps()
-            if isinstance(data, str):
-                f.write(data)
-            else:
-                json.dump(data, f)
-        logging.info("Garmin login successful, session saved")
-    except Exception as e:
-        logging.error(f"Garmin login failed: {e}")
-        client = None
-        raise e
-    return client
+def garmin_headers():
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "NK": "NT",
+        "X-app-ver": "4.65.1.0",
+        "Accept": "application/json",
+        "Cookie": f"JWT_WEB={JWT_WEB}; SESSIONID={SESSION_ID}",
+    }
 
 def require_secret(f):
     from functools import wraps
@@ -64,130 +34,101 @@ def require_secret(f):
 
 @app.route("/")
 def index():
-    return jsonify({"status": "Garmin sync server running", "endpoints": ["/health", "/sync", "/mfa"]})
+    return jsonify({"status": "Garmin sync server running"})
 
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
 
-@app.route("/mfa", methods=["POST"])
-def submit_mfa():
-    """Submit MFA code when Garmin requests it"""
-    global client
-    data = request.json or {}
-    code = data.get("code", "").strip()
-    secret = data.get("secret", "")
-    if secret != API_SECRET:
-        return jsonify({"error": "Unauthorized"}), 401
-    if not code:
-        return jsonify({"error": "No code provided"}), 400
-    try:
-        client = Garmin(EMAIL, PASSWORD)
-        client.login(code)
-        # Save session
-        with open(SESSION_FILE, "w") as f:
-            data = client.garth.dumps()
-            if isinstance(data, str):
-                f.write(data)
-            else:
-                json.dump(data, f)
-        return jsonify({"status": "MFA successful, logged in"})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+def garmin_get(path, params=None):
+    url = BASE + path
+    r = requests.get(url, headers=garmin_headers(), params=params, timeout=15)
+    if r.status_code == 401:
+        raise Exception("session_expired")
+    if not r.ok:
+        raise Exception(f"HTTP {r.status_code}: {r.text[:200]}")
+    return r.json()
 
 @app.route("/sync")
 @require_secret
 def sync():
-    """Fetch Garmin data for a given date (defaults to today)"""
     date_str = request.args.get("date", str(date.today()))
     try:
-        target_date = date.fromisoformat(date_str)
+        date.fromisoformat(date_str)
     except ValueError:
-        return jsonify({"error": "Invalid date format, use YYYY-MM-DD"}), 400
-
-    try:
-        gc = get_client()
-    except GarminConnectAuthenticationError:
-        return jsonify({"error": "mfa_required", "message": "Garmin needs MFA code. POST to /mfa with your code."}), 401
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Invalid date, use YYYY-MM-DD"}), 400
 
     result = {"date": date_str}
 
-    # Steps
+    # Daily summary - steps, calories etc
     try:
-        steps_data = gc.get_steps_data(date_str)
-        total_steps = sum(s.get("steps", 0) for s in steps_data) if steps_data else 0
-        result["steps"] = total_steps
+        data = garmin_get(f"/proxy/usersummary-service/usersummary/daily/{date_str}", {"_": date_str})
+        result["steps"] = data.get("totalSteps")
+        result["calories_burned"] = data.get("totalKilocalories")
+        result["active_calories"] = data.get("activeKilocalories")
+        result["floors"] = data.get("floorsAscended")
+        result["distance_km"] = round(data.get("totalDistanceMeters", 0) / 1000, 2)
+        result["active_minutes"] = data.get("highlyActiveSeconds", 0) // 60
+        result["stress_avg"] = data.get("averageStressLevel")
+        result["body_battery_high"] = data.get("maxBodyBattery")
+        result["body_battery_low"] = data.get("minBodyBattery")
     except Exception as e:
+        logging.warning(f"Daily summary error: {e}")
         result["steps"] = None
-        logging.warning(f"Steps error: {e}")
 
     # Sleep
     try:
-        sleep_data = gc.get_sleep_data(date_str)
-        if sleep_data and "dailySleepDTO" in sleep_data:
-            dto = sleep_data["dailySleepDTO"]
-            sleep_seconds = dto.get("sleepTimeSeconds", 0)
-            result["sleep_hours"] = round(sleep_seconds / 3600, 1) if sleep_seconds else None
-            result["sleep_score"] = sleep_data.get("dailySleepDTO", {}).get("sleepScores", {}).get("overall", {}).get("value", None)
-            # Map score to quality label
-            score = result["sleep_score"]
-            if score is not None:
-                if score >= 80: result["sleep_quality"] = "🌟 Great"
-                elif score >= 60: result["sleep_quality"] = "😊 Good"
-                elif score >= 40: result["sleep_quality"] = "😐 OK"
+        data = garmin_get(f"/proxy/wellness-service/wellness/dailySleepData/{date_str}", {"date": date_str, "nonSleepBufferMinutes": 60})
+        if data and "dailySleepDTO" in data:
+            dto = data["dailySleepDTO"]
+            secs = dto.get("sleepTimeSeconds", 0)
+            result["sleep_hours"] = round(secs / 3600, 1) if secs else None
+            result["sleep_deep_hours"] = round(dto.get("deepSleepSeconds", 0) / 3600, 1)
+            result["sleep_rem_hours"] = round(dto.get("remSleepSeconds", 0) / 3600, 1)
+            result["sleep_light_hours"] = round(dto.get("lightSleepSeconds", 0) / 3600, 1)
+            score = dto.get("sleepScores", {})
+            overall = score.get("overall", {}).get("value") if isinstance(score, dict) else None
+            result["sleep_score"] = overall
+            if overall is not None:
+                if overall >= 80: result["sleep_quality"] = "🌟 Great"
+                elif overall >= 60: result["sleep_quality"] = "😊 Good"
+                elif overall >= 40: result["sleep_quality"] = "😐 OK"
                 else: result["sleep_quality"] = "😴 Poor"
         else:
             result["sleep_hours"] = None
-            result["sleep_quality"] = None
     except Exception as e:
-        result["sleep_hours"] = None
         logging.warning(f"Sleep error: {e}")
+        result["sleep_hours"] = None
 
     # Heart rate
     try:
-        hr_data = gc.get_heart_rates(date_str)
-        if hr_data:
-            result["heart_rate_resting"] = hr_data.get("restingHeartRate")
-            result["heart_rate_max"] = hr_data.get("maxHeartRate")
-        else:
-            result["heart_rate_resting"] = None
+        data = garmin_get(f"/proxy/wellness-service/wellness/dailyHeartRate/{date_str}", {"date": date_str})
+        result["heart_rate_resting"] = data.get("restingHeartRate")
+        result["heart_rate_max"] = data.get("maxHeartRate")
+        result["heart_rate_min"] = data.get("minHeartRate")
     except Exception as e:
-        result["heart_rate_resting"] = None
         logging.warning(f"HR error: {e}")
+        result["heart_rate_resting"] = None
 
-    # Body battery / stress
+    # HRV
     try:
-        bb_data = gc.get_body_battery(date_str)
-        if bb_data and len(bb_data) > 0:
-            latest = bb_data[-1]
-            result["body_battery"] = latest.get("value")
+        data = garmin_get(f"/proxy/hrv-service/hrv/{date_str}")
+        if data and "hrvSummary" in data:
+            result["hrv"] = data["hrvSummary"].get("weeklyAvg")
+            result["hrv_last_night"] = data["hrvSummary"].get("lastNight")
         else:
-            result["body_battery"] = None
+            result["hrv"] = None
     except Exception as e:
-        result["body_battery"] = None
-        logging.warning(f"Body battery error: {e}")
+        logging.warning(f"HRV error: {e}")
+        result["hrv"] = None
 
-    # Calories burned
+    # Activities
     try:
-        stats = gc.get_stats(date_str)
-        if stats:
-            result["calories_burned"] = stats.get("totalKilocalories")
-            result["active_calories"] = stats.get("activeKilocalories")
-            result["floors"] = stats.get("floorsAscended")
-            result["intensity_minutes"] = stats.get("intensityMinutesGoal")
-        else:
-            result["calories_burned"] = None
-    except Exception as e:
-        result["calories_burned"] = None
-        logging.warning(f"Stats error: {e}")
-
-    # Activities / workouts
-    try:
-        activities = gc.get_activities_by_date(date_str, date_str)
+        data = garmin_get("/proxy/activitylist-service/activities/search/activities", {
+            "startDate": date_str, "endDate": date_str, "limit": 10, "start": 0
+        })
         result["activities"] = []
-        for act in (activities or []):
+        for act in (data or []):
             result["activities"].append({
                 "name": act.get("activityName", "Activity"),
                 "type": act.get("activityType", {}).get("typeKey", "unknown"),
@@ -195,33 +136,14 @@ def sync():
                 "calories": act.get("calories", 0),
                 "distance_km": round(act.get("distance", 0) / 1000, 2) if act.get("distance") else None,
                 "avg_hr": act.get("averageHR"),
+                "max_hr": act.get("maxHR"),
+                "steps": act.get("steps"),
             })
     except Exception as e:
-        result["activities"] = []
         logging.warning(f"Activities error: {e}")
-
-    # HRV
-    try:
-        hrv = gc.get_hrv_data(date_str)
-        if hrv and "hrvSummary" in hrv:
-            result["hrv"] = hrv["hrvSummary"].get("weeklyAvg")
-        else:
-            result["hrv"] = None
-    except Exception as e:
-        result["hrv"] = None
-        logging.warning(f"HRV error: {e}")
+        result["activities"] = []
 
     return jsonify(result)
-
-@app.route("/week")
-@require_secret
-def week():
-    """Fetch last 7 days summary"""
-    results = []
-    for i in range(7):
-        d = date.today() - timedelta(days=i)
-        results.append({"date": str(d), "pending": True})
-    return jsonify({"message": "Use /sync?date=YYYY-MM-DD for individual days", "last_7_days": [str(date.today() - timedelta(days=i)) for i in range(7)]})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
